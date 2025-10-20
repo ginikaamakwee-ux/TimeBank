@@ -25,6 +25,11 @@
 (define-constant ERR_INVALID_ORACLE (err u106))
 (define-constant ERR_TRANSFER_FAILED (err u107))
 (define-constant ERR_ALREADY_EXISTS (err u108))
+(define-constant ERR_CONTRACT_PAUSED (err u109))
+(define-constant ERR_INVALID_PRINCIPAL (err u110))
+(define-constant ERR_REENTRANCY (err u111))
+(define-constant ERR_OVERFLOW (err u112))
+(define-constant ERR_UNAUTHORIZED (err u113))
 
 (define-constant BASE_INTEREST_RATE u300) ;; 3% base rate (in basis points)
 (define-constant INFLATION_MULTIPLIER u100) ;; 1:1 inflation adjustment
@@ -42,6 +47,8 @@
 (define-data-var oracle-address (optional principal) none)
 (define-data-var governance-enabled bool false)
 (define-data-var total-governance-power uint u0)
+(define-data-var contract-paused bool false)
+(define-data-var reentrancy-guard bool false)
 
 ;; data maps
 (define-map deposits
@@ -96,8 +103,42 @@
 (define-data-var next-transfer-id uint u1)
 (define-data-var next-proposal-id uint u1)
 
+;; Admin whitelist for emergency functions
+(define-map admins
+  principal
+  bool
+)
+
+;; Initialize contract owner as admin
+(map-set admins CONTRACT_OWNER true)
 
 ;; public functions
+
+;; Emergency pause function
+(define-public (pause-contract)
+  (begin
+    (asserts! (default-to false (map-get? admins tx-sender)) ERR_UNAUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (default-to false (map-get? admins tx-sender)) ERR_UNAUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
+
+(define-public (add-admin (new-admin principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (not (is-eq new-admin CONTRACT_OWNER)) ERR_INVALID_PRINCIPAL)
+    (map-set admins new-admin true)
+    (ok true)
+  )
+)
 
 ;; Deposit STX into time-locked savings
 (define-public (deposit (amount uint) (lock-period uint) (emergency-insurance-enabled bool))
@@ -109,10 +150,13 @@
     (insurance-fee (if emergency-insurance-enabled (/ (* amount EMERGENCY_POOL_FEE) BASIS_POINTS) u0))
     (net-deposit (- amount insurance-fee))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (var-get reentrancy-guard)) ERR_REENTRANCY)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (>= lock-period MIN_LOCK_PERIOD) ERR_INVALID_AMOUNT)
     (asserts! (<= lock-period MAX_LOCK_PERIOD) ERR_INVALID_AMOUNT)
     (asserts! (is-none (map-get? deposits sender)) ERR_ALREADY_EXISTS)
+    (asserts! (>= amount insurance-fee) ERR_INVALID_AMOUNT)
     
     ;; Transfer STX from sender
     (try! (stx-transfer? amount sender (as-contract tx-sender)))
@@ -164,7 +208,11 @@
     (interest-earned (calculate-interest deposit-info))
     (total-withdrawal (+ principal-amount interest-earned))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (var-get reentrancy-guard)) ERR_REENTRANCY)
+    (var-set reentrancy-guard true)
     (asserts! (>= current-block unlock-block) ERR_LOCK_PERIOD_NOT_MET)
+    (asserts! (> principal-amount u0) ERR_INVALID_AMOUNT)
     
     ;; Transfer funds back to sender
     (try! (as-contract (stx-transfer? total-withdrawal tx-sender sender)))
@@ -175,6 +223,7 @@
     ;; Update total deposits
     (var-set total-deposits (- (var-get total-deposits) principal-amount))
     
+    (var-set reentrancy-guard false)
     (ok total-withdrawal)
   )
 )
@@ -189,6 +238,10 @@
     (penalty-amount (/ (* principal-amount EARLY_WITHDRAWAL_PENALTY) BASIS_POINTS))
     (net-withdrawal (- principal-amount penalty-amount))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (var-get reentrancy-guard)) ERR_REENTRANCY)
+    (var-set reentrancy-guard true)
+    (asserts! (> principal-amount u0) ERR_INVALID_AMOUNT)
     ;; Check if emergency insurance covers this withdrawal
     (if (and (is-some insurance-info) 
              (get emergency-insured deposit-info)
@@ -209,6 +262,7 @@
     ;; Update total deposits
     (var-set total-deposits (- (var-get total-deposits) principal-amount))
     
+    (var-set reentrancy-guard false)
     (ok net-withdrawal)
   )
 )
@@ -221,6 +275,9 @@
     (deposit-info (unwrap! (map-get? deposits sender) ERR_NOT_FOUND))
     (available-amount (get amount deposit-info))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (is-eq sender recipient)) ERR_INVALID_PRINCIPAL)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (<= amount available-amount) ERR_INSUFFICIENT_FUNDS)
     (asserts! (> unlock-condition (get-block)) ERR_INVALID_AMOUNT)
     
@@ -253,6 +310,9 @@
     (amount (get amount transfer-info))
     (unlock-condition (get unlock-condition transfer-info))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (var-get reentrancy-guard)) ERR_REENTRANCY)
+    (var-set reentrancy-guard true)
     (asserts! (is-eq tx-sender recipient) ERR_NOT_OWNER)
     (asserts! (>= (get-block) unlock-condition) ERR_LOCK_PERIOD_NOT_MET)
     (asserts! (not (get completed transfer-info)) ERR_ALREADY_EXISTS)
@@ -265,6 +325,7 @@
       (merge transfer-info { completed: true })
     )
     
+    (var-set reentrancy-guard false)
     (ok amount)
   )
 )
@@ -276,6 +337,7 @@
     (proposal-id (var-get next-proposal-id))
     (governance-balance (ft-get-balance timebank-token sender))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (>= governance-balance GOVERNANCE_THRESHOLD) ERR_INSUFFICIENT_FUNDS)
     
     (map-set governance-proposals proposal-id {
@@ -300,6 +362,8 @@
     (voting-power (ft-get-balance timebank-token sender))
     (existing-vote (map-get? governance-votes { proposal-id: proposal-id, voter: sender }))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (is-eq sender (get proposer proposal))) ERR_INVALID_PRINCIPAL)
     (asserts! (< (get-block) (get end-block proposal)) ERR_LOCK_PERIOD_NOT_MET)
     (asserts! (> voting-power u0) ERR_INSUFFICIENT_FUNDS)
     (asserts! (is-none existing-vote) ERR_ALREADY_EXISTS)
@@ -327,8 +391,11 @@
 ;; Oracle: Update CPI rate (only oracle can call)
 (define-public (update-cpi-rate (new-rate uint))
   (let ((oracle (var-get oracle-address)))
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (is-some oracle) ERR_INVALID_ORACLE)
     (asserts! (is-eq tx-sender (unwrap-panic oracle)) ERR_NOT_OWNER)
+    (asserts! (> new-rate u0) ERR_INVALID_AMOUNT)
+    (asserts! (< new-rate u10000) ERR_INVALID_AMOUNT)
     (var-set current-cpi-rate new-rate)
     (ok true)
   )
@@ -338,6 +405,7 @@
 (define-public (set-oracle-address (oracle principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (not (is-eq oracle tx-sender)) ERR_INVALID_PRINCIPAL)
     (var-set oracle-address (some oracle))
     (ok true)
   )
